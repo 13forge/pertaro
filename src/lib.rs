@@ -239,15 +239,9 @@ impl PertaroExpert243 {
     /// replaced by [`FNV1A64_BASIS`] so the stream is never the zero fixed point.
     #[inline(always)]
     pub const fn default_field(seed: u64, out: &mut [u8; LEAVES]) {
-        // Tree-split extraction. The eight digits of an accepted state are
-        // d0 + d1*243 + ... + d7*243^7. Splitting at 243^4 (fits u32) and then
-        // at 243^2 turns one eight-deep serial divide chain into one 64-bit
-        // split, two independent 32-bit splits, and four independent 32-bit
-        // splits: a critical path of three divides instead of eight. Digit
-        // order is unchanged, so the field is bit-identical to the serial form.
-        const P4: u64 = 3_486_784_401; // 243^4
-        const P2: u32 = 59_049; // 243^2
-        const R: u32 = MAX_PACKED as u32;
+        // Serial digit extraction. A tree split at 243^4 and 243^2 was tried
+        // in the 0.3.0 kernel and measured 10% slower on Zen 3 for identical
+        // output; the divide-by-constant chain is already well pipelined.
         let mut s = if seed == 0 { FNV1A64_BASIS } else { seed };
         let mut idx = 0usize;
         while idx < LEAVES {
@@ -255,36 +249,13 @@ impl PertaroExpert243 {
             if s >= RADIX_243_POW_8 {
                 continue;
             }
-            let lo4 = (s % P4) as u32;
-            let hi4 = (s / P4) as u32;
-            let (p0, p1, p2, p3) = (lo4 % P2, lo4 / P2, hi4 % P2, hi4 / P2);
-            let digits = [
-                (p0 % R) as u8,
-                (p0 / R) as u8,
-                (p1 % R) as u8,
-                (p1 / R) as u8,
-                (p2 % R) as u8,
-                (p2 / R) as u8,
-                (p3 % R) as u8,
-                (p3 / R) as u8,
-            ];
-            if idx + DIGITS_PER_WORD <= LEAVES {
-                out[idx] = digits[0];
-                out[idx + 1] = digits[1];
-                out[idx + 2] = digits[2];
-                out[idx + 3] = digits[3];
-                out[idx + 4] = digits[4];
-                out[idx + 5] = digits[5];
-                out[idx + 6] = digits[6];
-                out[idx + 7] = digits[7];
-                idx += DIGITS_PER_WORD;
-            } else {
-                let mut k = 0;
-                while idx < LEAVES {
-                    out[idx] = digits[k];
-                    idx += 1;
-                    k += 1;
-                }
+            let mut word = s;
+            let mut k = 0;
+            while k < DIGITS_PER_WORD && idx < LEAVES {
+                out[idx] = (word % MAX_PACKED as u64) as u8;
+                word /= MAX_PACKED as u64;
+                idx += 1;
+                k += 1;
             }
         }
     }
@@ -995,7 +966,7 @@ mod kernel_equivalence {
     }
 
     #[test]
-    fn tree_split_field_is_bit_identical_to_serial() {
+    fn field_is_bit_identical_to_the_0_2_0_extractor() {
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
         for _ in 0..20_000 {
             seed = xorshift64(seed) ^ 0xA5A5;
