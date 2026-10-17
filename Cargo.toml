@@ -1,0 +1,24 @@
+[package]
+name = "pertaro"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/13forge/pertaro"
+description = "Cache-resident 256-byte neuro-symbolic micro-experts via xorshift64 seed compression, 5-tier ternary tries (3^5 = 243), and in-band stable-model regrounding."
+keywords = ["no_std", "asp", "moe", "ternary", "compression"]
+categories = ["no-std", "algorithms", "science", "data-structures"]
+
+# Standalone root: the enclosing repository's workspace never claims this crate.
+[workspace]
+
+[features]
+default = []
+std = []
+
+[dependencies]
+# Strictly zero external dependencies.
+
+[lints.rust]
+unsafe_code = "forbid"
