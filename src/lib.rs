@@ -239,6 +239,15 @@ impl PertaroExpert243 {
     /// replaced by [`FNV1A64_BASIS`] so the stream is never the zero fixed point.
     #[inline(always)]
     pub const fn default_field(seed: u64, out: &mut [u8; LEAVES]) {
+        // Tree-split extraction. The eight digits of an accepted state are
+        // d0 + d1*243 + ... + d7*243^7. Splitting at 243^4 (fits u32) and then
+        // at 243^2 turns one eight-deep serial divide chain into one 64-bit
+        // split, two independent 32-bit splits, and four independent 32-bit
+        // splits: a critical path of three divides instead of eight. Digit
+        // order is unchanged, so the field is bit-identical to the serial form.
+        const P4: u64 = 3_486_784_401; // 243^4
+        const P2: u32 = 59_049; // 243^2
+        const R: u32 = MAX_PACKED as u32;
         let mut s = if seed == 0 { FNV1A64_BASIS } else { seed };
         let mut idx = 0usize;
         while idx < LEAVES {
@@ -246,13 +255,36 @@ impl PertaroExpert243 {
             if s >= RADIX_243_POW_8 {
                 continue;
             }
-            let mut word = s;
-            let mut k = 0;
-            while k < DIGITS_PER_WORD && idx < LEAVES {
-                out[idx] = (word % MAX_PACKED as u64) as u8;
-                word /= MAX_PACKED as u64;
-                idx += 1;
-                k += 1;
+            let lo4 = (s % P4) as u32;
+            let hi4 = (s / P4) as u32;
+            let (p0, p1, p2, p3) = (lo4 % P2, lo4 / P2, hi4 % P2, hi4 / P2);
+            let digits = [
+                (p0 % R) as u8,
+                (p0 / R) as u8,
+                (p1 % R) as u8,
+                (p1 / R) as u8,
+                (p2 % R) as u8,
+                (p2 / R) as u8,
+                (p3 % R) as u8,
+                (p3 / R) as u8,
+            ];
+            if idx + DIGITS_PER_WORD <= LEAVES {
+                out[idx] = digits[0];
+                out[idx + 1] = digits[1];
+                out[idx + 2] = digits[2];
+                out[idx + 3] = digits[3];
+                out[idx + 4] = digits[4];
+                out[idx + 5] = digits[5];
+                out[idx + 6] = digits[6];
+                out[idx + 7] = digits[7];
+                idx += DIGITS_PER_WORD;
+            } else {
+                let mut k = 0;
+                while idx < LEAVES {
+                    out[idx] = digits[k];
+                    idx += 1;
+                    k += 1;
+                }
             }
         }
     }
@@ -268,10 +300,21 @@ impl PertaroExpert243 {
         let mut idx = 0usize;
         while idx < LEAVES {
             let raw = self.0.trits[idx];
-            out.trits[idx] = if raw < MAX_PACKED {
-                ((base[idx] as u16 + raw as u16) % MAX_PACKED as u16) as u8
-            } else if raw == Sentinel::NullNode as u8 {
-                base[idx]
+            let b = base[idx];
+            // b < 243 and, when raw is a coordinate, raw < 243, so the sum is
+            // below 486 and one conditional subtraction is the modulo.
+            let sum = b as u16 + raw as u16;
+            let wrapped = (if sum >= MAX_PACKED as u16 {
+                sum - MAX_PACKED as u16
+            } else {
+                sum
+            }) as u8;
+            let is_coord = raw < MAX_PACKED;
+            let is_null = raw == Sentinel::NullNode as u8;
+            out.trits[idx] = if is_coord {
+                wrapped
+            } else if is_null {
+                b
             } else {
                 raw
             };
@@ -485,6 +528,18 @@ impl AnswerSetMask {
         self.0[0] | self.0[1] | self.0[2] | self.0[3] == 0
     }
 
+    /// The set as a 256-entry byte table: `1` where the atom is present.
+    #[inline(always)]
+    pub const fn as_bytes(&self) -> [u8; 256] {
+        let mut t = [0u8; 256];
+        let mut i = 0usize;
+        while i < 256 {
+            t[i] = ((self.0[i >> 6] >> (i & 63)) & 1) as u8;
+            i += 1;
+        }
+        t
+    }
+
     /// The lowest atom in the set that is a leaf (`< 243`), or `None`.
     #[inline(always)]
     pub const fn first_winner(&self) -> Option<u8> {
@@ -629,22 +684,27 @@ impl PertaroExpert243 {
         materialized: &Word256,
         s: &AnswerSetMask,
     ) -> AnswerSetMask {
+        // Branch-free: every predicate is computed and the bit is selected.
+        // Each 64-leaf block accumulates in a register and stores once, so
+        // there is no read-modify-write chain through memory.
         let mut cn = AnswerSetMask::empty();
         let mut idx = 0usize;
+        let mut w = 0usize;
         while idx < LEAVES {
-            let raw = self.0.trits[idx];
-            let v = materialized.trits[idx];
-            let derived = if raw == Sentinel::Tombstone as u8 || v == Sentinel::Tombstone as u8 {
-                false // integrity constraint: defeated
-            } else if raw == Sentinel::NullNode as u8 {
-                true // fact
-            } else {
-                v < MAX_PACKED && !s.contains(v) // idx :- not v.
-            };
-            if derived {
-                cn.insert(idx as u8);
+            let end = if idx + 64 < LEAVES { idx + 64 } else { LEAVES };
+            let mut acc = 0u64;
+            while idx < end {
+                let raw = self.0.trits[idx];
+                let v = materialized.trits[idx];
+                let tomb = (raw == Sentinel::Tombstone as u8) | (v == Sentinel::Tombstone as u8);
+                let fact = raw == Sentinel::NullNode as u8;
+                let rule = (v < MAX_PACKED) & !s.contains(v); // idx :- not v.
+                let derived = !tomb & (fact | rule);
+                acc |= (derived as u64) << (idx & 63);
+                idx += 1;
             }
-            idx += 1;
+            cn.0[w] = acc;
+            w += 1;
         }
         cn
     }
@@ -664,15 +724,84 @@ impl PertaroExpert243 {
     /// bounded-cost pass the arena runs on every frontier node; the exact
     /// check is one call away for callers that need it.
     pub fn prune_frontier(&mut self) -> AnswerSetMask {
-        let mat = self.materialize();
-        let s1 = self.gl_reduct_consequences(&mat, &AnswerSetMask::empty());
-        let s2 = self.gl_reduct_consequences(&mat, &s1);
-        let mut idx = 0usize;
-        while idx < LEAVES {
-            if self.0.trits[idx] < MAX_PACKED && !s2.contains(idx as u8) {
-                self.0.trits[idx] = Sentinel::Tombstone as u8;
+        // Fused fast path. Semantically identical to
+        // `materialize` + `gl_reduct_consequences(∅)` + `gl_reduct_consequences(S1)`
+        // + stamping, which the tests assert; two loops instead of four.
+        let mut base = [0u8; LEAVES];
+        Self::default_field(self.0.hash, &mut base);
+        let mut mat = [0u8; PAYLOAD_BYTES];
+        mat[ROOT_SENTINEL] = self.0.trits[ROOT_SENTINEL];
+
+        // Pass A: resolve each leaf and take Cn(P^∅) in the same sweep.
+        // Under the empty set every rule survives, so `rule` is just `v < 243`.
+        // Written over slices with no data-dependent index so LLVM can
+        // vectorize the byte compares and selects; bits are packed afterwards.
+        // `derived_a` is 256 wide so pass B can index it by any byte value
+        // without a bounds check: entries 243..=255 stay zero, and a `v` there
+        // never satisfies `v < 243` anyway.
+        let mut derived_a = [0u8; 256];
+        let raw_leaves: &[u8; LEAVES] = self.leaves();
+        for (((m, d), &raw), &b) in mat[..LEAVES]
+            .iter_mut()
+            .zip(derived_a[..LEAVES].iter_mut())
+            .zip(raw_leaves.iter())
+            .zip(base.iter())
+        {
+            let sum = b as u16 + raw as u16;
+            let wrapped = (if sum >= MAX_PACKED as u16 {
+                sum - MAX_PACKED as u16
+            } else {
+                sum
+            }) as u8;
+            let is_coord = raw < MAX_PACKED;
+            let is_null = raw == Sentinel::NullNode as u8;
+            let v = if is_coord {
+                wrapped
+            } else if is_null {
+                b
+            } else {
+                raw
+            };
+            *m = v;
+            let tomb = (raw == Sentinel::Tombstone as u8) | (v == Sentinel::Tombstone as u8);
+            *d = (!tomb & (is_null | (v < MAX_PACKED))) as u8;
+        }
+        let mut s1 = AnswerSetMask::empty();
+        for (w, chunk) in derived_a[..LEAVES].chunks(64).enumerate() {
+            let mut acc = 0u64;
+            for (bit, &d) in chunk.iter().enumerate() {
+                acc |= (d as u64) << bit;
             }
-            idx += 1;
+            s1.0[w] = acc;
+        }
+
+        // Pass B: Cn(P^S1) and the stamp in the same sweep. `derived_a` is S1
+        // as a byte table already, so no table is rebuilt.
+        let blocked = &derived_a;
+        let mut s2 = AnswerSetMask::empty();
+        let mut idx = 0usize;
+        let mut w = 0usize;
+        while idx < LEAVES {
+            let end = if idx + 64 < LEAVES { idx + 64 } else { LEAVES };
+            let mut acc = 0u64;
+            while idx < end {
+                let raw = self.0.trits[idx];
+                let v = mat[idx];
+                let tomb = (raw == Sentinel::Tombstone as u8) | (v == Sentinel::Tombstone as u8);
+                let fact = raw == Sentinel::NullNode as u8;
+                let rule = (v < MAX_PACKED) & (blocked[v as usize] == 0);
+                let derived = !tomb & (fact | rule);
+                acc |= (derived as u64) << (idx & 63);
+                let stamp = (raw < MAX_PACKED) & !derived;
+                self.0.trits[idx] = if stamp {
+                    Sentinel::Tombstone as u8
+                } else {
+                    raw
+                };
+                idx += 1;
+            }
+            s2.0[w] = acc;
+            w += 1;
         }
         s2
     }
@@ -819,5 +948,165 @@ mod arena_tests {
         }
         let again = x.prune_frontier();
         assert_eq!(again, s2);
+    }
+}
+#[cfg(test)]
+mod kernel_equivalence {
+    use super::*;
+
+    /// The 0.2.0 serial extractor, kept as the reference.
+    fn reference_default_field(seed: u64, out: &mut [u8; LEAVES]) {
+        let mut s = if seed == 0 { FNV1A64_BASIS } else { seed };
+        let mut idx = 0usize;
+        while idx < LEAVES {
+            s = xorshift64(s);
+            if s >= RADIX_243_POW_8 {
+                continue;
+            }
+            let mut word = s;
+            let mut k = 0;
+            while k < DIGITS_PER_WORD && idx < LEAVES {
+                out[idx] = (word % MAX_PACKED as u64) as u8;
+                word /= MAX_PACKED as u64;
+                idx += 1;
+                k += 1;
+            }
+        }
+    }
+
+    /// The 0.2.0 branching reduct, kept as the reference.
+    fn reference_reduct(x: &PertaroExpert243, mat: &Word256, s: &AnswerSetMask) -> AnswerSetMask {
+        let mut cn = AnswerSetMask::empty();
+        for idx in 0..LEAVES {
+            let raw = x.0.trits[idx];
+            let v = mat.trits[idx];
+            let derived = if raw == Sentinel::Tombstone as u8 || v == Sentinel::Tombstone as u8 {
+                false
+            } else if raw == Sentinel::NullNode as u8 {
+                true
+            } else {
+                v < MAX_PACKED && !s.contains(v)
+            };
+            if derived {
+                cn.insert(idx as u8);
+            }
+        }
+        cn
+    }
+
+    #[test]
+    fn tree_split_field_is_bit_identical_to_serial() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..20_000 {
+            seed = xorshift64(seed) ^ 0xA5A5;
+            let mut a = [0u8; LEAVES];
+            let mut b = [0u8; LEAVES];
+            PertaroExpert243::default_field(seed, &mut a);
+            reference_default_field(seed, &mut b);
+            assert_eq!(a, b, "seed {seed:#x}");
+        }
+        let mut a = [0u8; LEAVES];
+        let mut b = [0u8; LEAVES];
+        PertaroExpert243::default_field(0, &mut a);
+        reference_default_field(0, &mut b);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn conditional_subtraction_is_mod_243_on_the_whole_domain() {
+        for b in 0..MAX_PACKED as u16 {
+            for raw in 0..MAX_PACKED as u16 {
+                let sum = b + raw;
+                let wrapped = if sum >= 243 { sum - 243 } else { sum };
+                assert_eq!(wrapped, sum % 243);
+            }
+        }
+    }
+
+    #[test]
+    fn fused_prune_matches_the_four_step_reference() {
+        let mut rng = 0xDEAD_BEEF_CAFE_F00Du64;
+        for _ in 0..2_000 {
+            rng = xorshift64(rng);
+            let mut w = Word256 {
+                hash: rng,
+                parent: 3,
+                trits: [0; PAYLOAD_BYTES],
+            };
+            for t in w.trits.iter_mut() {
+                rng = xorshift64(rng);
+                *t = match rng % 10 {
+                    0 => Sentinel::NullNode as u8,
+                    1 => Sentinel::Tombstone as u8,
+                    2 => 243 + (rng >> 8) as u8 % 13,
+                    _ => ((rng >> 16) % 243) as u8,
+                };
+            }
+            // reference: the four separate steps
+            let x = PertaroExpert243(w);
+            let mat = x.materialize();
+            let r1 = reference_reduct(&x, &mat, &AnswerSetMask::empty());
+            let r2 = reference_reduct(&x, &mat, &r1);
+            let mut expect = x;
+            for i in 0..LEAVES {
+                if expect.0.trits[i] < MAX_PACKED && !r2.contains(i as u8) {
+                    expect.0.trits[i] = Sentinel::Tombstone as u8;
+                }
+            }
+            let mut got = PertaroExpert243(w);
+            let s2 = got.prune_frontier();
+            assert_eq!(s2, r2);
+            assert_eq!(got.0, expect.0);
+        }
+    }
+
+    #[test]
+    fn as_bytes_matches_contains() {
+        let mut m = AnswerSetMask::empty();
+        for a in [0u8, 1, 63, 64, 127, 128, 200, 242, 243, 255] {
+            m.insert(a);
+        }
+        let t = m.as_bytes();
+        for a in 0..=255u8 {
+            assert_eq!(t[a as usize] == 1, m.contains(a), "{a}");
+        }
+    }
+
+    #[test]
+    fn branch_free_reduct_matches_reference_on_random_programs() {
+        let mut rng = 0xC0FF_EE00_1234_5678u64;
+        for _ in 0..2_000 {
+            rng = xorshift64(rng);
+            let mut w = Word256 {
+                hash: rng,
+                parent: 0,
+                trits: [0; PAYLOAD_BYTES],
+            };
+            for t in w.trits.iter_mut() {
+                rng = xorshift64(rng);
+                // mostly coordinates, some sentinels of every kind
+                *t = match rng % 10 {
+                    0 => Sentinel::NullNode as u8,
+                    1 => Sentinel::Tombstone as u8,
+                    2 => 243 + (rng >> 8) as u8 % 13,
+                    _ => ((rng >> 16) % 243) as u8,
+                };
+            }
+            let x = PertaroExpert243(w);
+            let mat = x.materialize();
+            let mut s = AnswerSetMask::empty();
+            for _ in 0..40 {
+                rng = xorshift64(rng);
+                s.insert((rng % 256) as u8);
+            }
+            assert_eq!(
+                x.gl_reduct_consequences(&mat, &s),
+                reference_reduct(&x, &mat, &s)
+            );
+            assert_eq!(
+                x.gl_reduct_consequences(&mat, &AnswerSetMask::empty()),
+                reference_reduct(&x, &mat, &AnswerSetMask::empty())
+            );
+        }
     }
 }

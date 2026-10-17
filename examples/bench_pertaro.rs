@@ -87,6 +87,53 @@ fn main() {
     }
     let ns_single = t0.elapsed().as_nanos() as f64 / ITERS as f64;
 
+    // 1b. Same, with pseudo-random leaf bytes (coordinates and every sentinel
+    // kind), so branch predictors see a realistic payload, not one byte repeated.
+    let mut rnd = Word256 {
+        hash: FNV1A64_BASIS,
+        parent: 0,
+        trits: [0u8; 244],
+    };
+    let mut g = 0x1234_5678_9ABC_DEF0u64;
+    for t in rnd.trits.iter_mut() {
+        g = xorshift64(g);
+        *t = match g % 10 {
+            0 => Sentinel::NullNode as u8,
+            1 => Sentinel::Tombstone as u8,
+            2 => 243 + ((g >> 8) % 13) as u8,
+            _ => ((g >> 16) % 243) as u8,
+        };
+    }
+    rnd.trits[ROOT_SENTINEL] = Sentinel::NullNode as u8;
+    let rnd_expert = PertaroExpert243(rnd);
+    let t0b = Instant::now();
+    for _ in 0..ITERS {
+        let mut e = black_box(rnd_expert);
+        black_box(e.prune_frontier());
+    }
+    let ns_single_rnd = t0b.elapsed().as_nanos() as f64 / ITERS as f64;
+
+    // 1c. Stage attribution on the random payload: field, materialize, one reduct pass.
+    let mut field = [0u8; 243];
+    let t_f = Instant::now();
+    for i in 0..ITERS {
+        PertaroExpert243::default_field(black_box(rnd_expert.seed() ^ i as u64), &mut field);
+        black_box(&field);
+    }
+    let ns_field = t_f.elapsed().as_nanos() as f64 / ITERS as f64;
+    let t_m = Instant::now();
+    for _ in 0..ITERS {
+        black_box(black_box(rnd_expert).materialize());
+    }
+    let ns_mat = t_m.elapsed().as_nanos() as f64 / ITERS as f64;
+    let mat = rnd_expert.materialize();
+    let empty = pertaro::AnswerSetMask::empty();
+    let t_r = Instant::now();
+    for _ in 0..ITERS {
+        black_box(black_box(rnd_expert).gl_reduct_consequences(black_box(&mat), black_box(&empty)));
+    }
+    let ns_reduct = t_r.elapsed().as_nanos() as f64 / ITERS as f64;
+
     // 2. Tier-4 arena: expand, prune the 81 frontier nodes, reground.
     let mut arena = Box::new(PertaroArena121 {
         nodes: [expert; ARENA_NODES],
@@ -139,7 +186,12 @@ fn main() {
         ARENA_NODES * 256
     );
     println!("==============================================================");
-    println!("1. one word, materialize + reduct + prune : {ns_single:>8.1} ns");
+    println!("1. one word, materialize + reduct + prune : {ns_single:>8.1} ns  (uniform payload)");
+    println!("1b. same, random payload                  : {ns_single_rnd:>8.1} ns");
+    println!("1c. attribution (random payload):");
+    println!("      default_field (243 digits)          : {ns_field:>8.1} ns");
+    println!("      materialize (field + resolve)       : {ns_mat:>8.1} ns");
+    println!("      one gl_reduct pass                  : {ns_reduct:>8.1} ns");
     println!("2. tier-4 arena, expand + 81 prunes       : {ns_l1_node:>8.1} ns/node");
     println!("3. tier-6 bank, 1093 prunes (control)     : {ns_spill_node:>8.1} ns/node");
     println!("4. light touch, by working set (tier-4 frontier starts at node {FRONTIER_START}):");
