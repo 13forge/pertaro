@@ -40,6 +40,25 @@ fn touch(node: &mut PertaroExpert243, atom: u8) -> u64 {
     s
 }
 
+/// Dependent chase: the next index comes from the word just touched, so every
+/// load waits for the previous one. This exposes load-to-use latency, which
+/// independent loads hide behind memory-level parallelism.
+fn chase_pass(arena: &mut [PertaroExpert243], passes: usize) -> f64 {
+    let n = arena.len();
+    let mut i = 0usize;
+    let mut acc = 0u64;
+    let t = Instant::now();
+    for _ in 0..passes {
+        for _ in 0..n {
+            let s = touch(&mut arena[i], (acc & 0xFF) as u8 % 243);
+            acc ^= s;
+            i = (s % n as u64) as usize;
+        }
+    }
+    black_box(acc);
+    t.elapsed().as_nanos() as f64 / (passes * n) as f64
+}
+
 fn random_pass(arena: &mut [PertaroExpert243], passes: usize) -> f64 {
     let n = arena.len();
     let mut rng = FNV1A64_BASIS;
@@ -103,13 +122,15 @@ fn main() {
     let ns_spill_node = t2.elapsed().as_nanos() as f64 / (spill_iters * TIER6_NODES) as f64;
 
     // 4. The cliff test: light random-order touches over growing working sets.
-    let sizes = [121usize, 364, 1093, 3280, 9841];
+    let sizes = [121usize, 364, 1093, 3280, 9841, 29524];
     let mut cliff = Vec::new();
     for &n in &sizes {
         let mut a = vec![expert; n];
         random_pass(&mut a, 2); // warm
         let passes = (2_000_000 / n).max(20);
-        cliff.push((n, n * 256, random_pass(&mut a, passes)));
+        let independent = random_pass(&mut a, passes);
+        let dependent = chase_pass(&mut a, passes);
+        cliff.push((n, n * 256, independent, dependent));
     }
 
     println!("==============================================================");
@@ -121,15 +142,12 @@ fn main() {
     println!("1. one word, materialize + reduct + prune : {ns_single:>8.1} ns");
     println!("2. tier-4 arena, expand + 81 prunes       : {ns_l1_node:>8.1} ns/node");
     println!("3. tier-6 bank, 1093 prunes (control)     : {ns_spill_node:>8.1} ns/node");
-    println!("4. light random touch, by working set:");
-    println!("     nodes    bytes       ns/touch");
-    for (n, bytes, ns) in cliff {
-        let tier = match n {
-            121 => "L1",
-            364 | 1093 => "L2",
-            _ => "L2/L3",
-        };
-        println!("   {n:>7} {bytes:>9} {ns:>12.2}   ({tier}, frontier start {FRONTIER_START})");
+    println!("4. light touch, by working set (tier-4 frontier starts at node {FRONTIER_START}):");
+    println!("     nodes      bytes   independent ns   dependent ns");
+    for (n, bytes, ind, dep) in cliff {
+        println!("   {n:>7} {bytes:>10} {ind:>14.2} {dep:>14.2}");
     }
+    println!("   independent = random index from an RNG (loads overlap)");
+    println!("   dependent   = next index from the word just loaded (loads serialize)");
     println!("==============================================================");
 }
