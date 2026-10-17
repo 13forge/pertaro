@@ -27,6 +27,7 @@
 
 #![no_std]
 #![forbid(unsafe_code)]
+#![doc = include_str!("../README.md")]
 
 #[cfg(feature = "std")]
 extern crate std;
@@ -411,5 +412,412 @@ mod tests {
     #[should_panic]
     fn reground_refuses_a_sentinel_as_winner() {
         let _ = PertaroExpert243(word(1)).reground_seed(243, Sentinel::NullNode);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 121-NODE L1 ARENA AND THE GELFOND-LIFSCHITZ REDUCT
+// ---------------------------------------------------------------------------
+
+/// Tiers resident in the arena: `0..=4`.
+pub const ARENA_TIERS: usize = 5;
+
+/// Nodes in a complete 4-tier ternary routing arena:
+/// `1 + 3 + 9 + 27 + 81 = 121`.
+pub const ARENA_NODES: usize = (3usize.pow(ARENA_TIERS as u32) - 1) / 2;
+
+/// Index of the first Tier-4 frontier node: `1 + 3 + 9 + 27 = 40`.
+pub const FRONTIER_START: usize = (3usize.pow(ARENA_TIERS as u32 - 1) - 1) / 2;
+
+/// Frontier nodes: `3^4 = 81`.
+pub const FRONTIER_NODES: usize = ARENA_NODES - FRONTIER_START;
+
+/// Exact byte footprint of the arena: `121 * 256 = 30,976` bytes.
+pub const ARENA_BYTES: usize = ARENA_NODES * core::mem::size_of::<Word256>();
+
+/// The L1 data cache size the arena is sized against.
+pub const L1_BUDGET_BYTES: usize = 32 * 1024;
+
+const _: () = assert!(ARENA_NODES == 121);
+const _: () = assert!(FRONTIER_START == 40);
+const _: () = assert!(FRONTIER_NODES == 81);
+const _: () = assert!(ARENA_BYTES == 30_976);
+const _: () = assert!(ARENA_BYTES < L1_BUDGET_BYTES);
+// Tier 5 (364 nodes) does not fit: the frontier is a hardware fact, not a tunable.
+const _: () = assert!((ARENA_NODES + FRONTIER_NODES * 3) * 256 > L1_BUDGET_BYTES);
+
+/// A 256-bit set over atoms `0..=255`: a candidate or derived answer set
+/// `S` over the 243 leaves. Four `u64` words, no heap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AnswerSetMask(pub [u64; 4]);
+
+impl AnswerSetMask {
+    /// The empty set.
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        Self([0; 4])
+    }
+
+    /// Insert `atom`.
+    #[inline(always)]
+    pub const fn insert(&mut self, atom: u8) {
+        self.0[(atom >> 6) as usize] |= 1u64 << (atom & 63);
+    }
+
+    /// Whether `atom` is in the set.
+    #[inline(always)]
+    pub const fn contains(&self, atom: u8) -> bool {
+        (self.0[(atom >> 6) as usize] & (1u64 << (atom & 63))) != 0
+    }
+
+    /// Number of atoms in the set.
+    #[inline(always)]
+    pub const fn count_ones(&self) -> u32 {
+        self.0[0].count_ones()
+            + self.0[1].count_ones()
+            + self.0[2].count_ones()
+            + self.0[3].count_ones()
+    }
+
+    /// Whether the set is empty.
+    #[inline(always)]
+    pub const fn is_empty(&self) -> bool {
+        self.0[0] | self.0[1] | self.0[2] | self.0[3] == 0
+    }
+
+    /// The lowest atom in the set that is a leaf (`< 243`), or `None`.
+    #[inline(always)]
+    pub const fn first_winner(&self) -> Option<u8> {
+        let mut w = 0;
+        while w < 4 {
+            if self.0[w] != 0 {
+                let atom = (w as u8) * 64 + self.0[w].trailing_zeros() as u8;
+                return if atom < MAX_PACKED { Some(atom) } else { None };
+            }
+            w += 1;
+        }
+        None
+    }
+}
+
+/// The complete 4-tier L1-resident ternary trie arena: 121 words, 30,976 bytes.
+///
+/// Breadth-first layout: tier `t` occupies `(3^t - 1) / 2 .. (3^(t+1) - 1) / 2`.
+///
+/// | tier | indices    | nodes |
+/// |------|------------|-------|
+/// | 0    | `0`        | 1     |
+/// | 1    | `1..4`     | 3     |
+/// | 2    | `4..13`    | 9     |
+/// | 3    | `13..40`   | 27    |
+/// | 4    | `40..121`  | 81 (the frontier) |
+#[repr(C, align(256))]
+#[derive(Clone, Copy)]
+pub struct PertaroArena121 {
+    /// The nodes, breadth-first.
+    pub nodes: [PertaroExpert243; ARENA_NODES],
+}
+
+const _: () = assert!(core::mem::size_of::<PertaroArena121>() == ARENA_BYTES);
+const _: () = assert!(core::mem::align_of::<PertaroArena121>() == 256);
+
+impl PertaroArena121 {
+    /// An arena of all-zero words.
+    pub const ZERO: Self = Self {
+        nodes: [PertaroExpert243(Word256::ZERO); ARENA_NODES],
+    };
+
+    /// Flat index of the node at `tier` (`0..=4`), position `offset` (`0..3^tier`).
+    /// Out-of-range input is a panic: the address is the contract.
+    #[inline(always)]
+    pub const fn node_index(tier: usize, offset: usize) -> usize {
+        const TIER_BASE: [usize; ARENA_TIERS] = [0, 1, 4, 13, 40];
+        assert!(tier < ARENA_TIERS, "pertaro arena tier outside 0..5");
+        assert!(
+            offset < 3usize.pow(tier as u32),
+            "pertaro arena offset outside the tier"
+        );
+        TIER_BASE[tier] + offset
+    }
+
+    /// The three child indices of the node at `parent` (`0..40`).
+    #[inline(always)]
+    pub const fn children_of(parent: usize) -> [usize; 3] {
+        assert!(
+            parent < FRONTIER_START,
+            "pertaro arena: a frontier node has no children"
+        );
+        let base = 3 * parent + 1;
+        [base, base + 1, base + 2]
+    }
+
+    /// The parent index of the node at `idx` (`1..121`).
+    #[inline(always)]
+    pub const fn parent_of(idx: usize) -> usize {
+        assert!(
+            idx > 0 && idx < ARENA_NODES,
+            "pertaro arena: index outside 1..121"
+        );
+        (idx - 1) / 3
+    }
+
+    /// Expand a root seed across all 121 nodes on `input_atom` (`0..243`).
+    ///
+    /// Every non-root node's seed is derived from its parent by
+    /// [`PertaroExpert243::reground_seed`] on `(input_atom + branch) mod 243`,
+    /// its `parent` field is set to the parent's index, and its root byte to
+    /// `phase`. Leaf bytes are untouched: they are the stored exceptions, seeds
+    /// are the derived defaults. An `input_atom` at or above 243 is a panic.
+    pub fn expand_from_root(&mut self, root_seed: u64, input_atom: u8, phase: Sentinel) {
+        assert!(
+            input_atom < MAX_PACKED,
+            "pertaro expand: input atom outside the 243 leaves"
+        );
+        self.nodes[0].0.hash = root_seed;
+        self.nodes[0].0.parent = 0;
+        self.nodes[0].0.trits[ROOT_SENTINEL] = phase as u8;
+
+        let mut parent = 0usize;
+        while parent < FRONTIER_START {
+            let children = Self::children_of(parent);
+            let mut seeds = [0u64; 3];
+            let mut b = 0usize;
+            while b < 3 {
+                let winner = ((input_atom as usize + b) % LEAVES) as u8;
+                seeds[b] = self.nodes[parent].reground_seed(winner, phase);
+                b += 1;
+            }
+            let mut b = 0usize;
+            while b < 3 {
+                let child = &mut self.nodes[children[b]].0;
+                child.hash = seeds[b];
+                child.parent = parent as u32;
+                child.trits[ROOT_SENTINEL] = phase as u8;
+                b += 1;
+            }
+            parent += 1;
+        }
+    }
+
+    /// The frontier: the 81 Tier-4 nodes.
+    #[inline(always)]
+    pub fn frontier(&self) -> &[PertaroExpert243] {
+        &self.nodes[FRONTIER_START..]
+    }
+
+    /// The frontier, mutable.
+    #[inline(always)]
+    pub fn frontier_mut(&mut self) -> &mut [PertaroExpert243] {
+        &mut self.nodes[FRONTIER_START..]
+    }
+}
+
+impl PertaroExpert243 {
+    /// Consequences of the Gelfond-Lifschitz reduct of this expert's program
+    /// under candidate set `s`: `Cn(P^S)`.
+    ///
+    /// `materialized` must be [`materialize`](Self::materialize) of this same
+    /// expert; the raw word supplies the rule shape, the materialized word the
+    /// rule body. Per leaf `idx` in `0..243`:
+    ///
+    /// - raw or materialized `Tombstone` (245): integrity constraint, never derived;
+    /// - raw `NullNode` (243): fact `idx.`, always derived;
+    /// - materialized value `v < 243`: rule `idx :- not v.`, derived iff `v` is not in `s`;
+    /// - any other sentinel: no rule, never derived.
+    pub fn gl_reduct_consequences(
+        &self,
+        materialized: &Word256,
+        s: &AnswerSetMask,
+    ) -> AnswerSetMask {
+        let mut cn = AnswerSetMask::empty();
+        let mut idx = 0usize;
+        while idx < LEAVES {
+            let raw = self.0.trits[idx];
+            let v = materialized.trits[idx];
+            let derived = if raw == Sentinel::Tombstone as u8 || v == Sentinel::Tombstone as u8 {
+                false // integrity constraint: defeated
+            } else if raw == Sentinel::NullNode as u8 {
+                true // fact
+            } else {
+                v < MAX_PACKED && !s.contains(v) // idx :- not v.
+            };
+            if derived {
+                cn.insert(idx as u8);
+            }
+            idx += 1;
+        }
+        cn
+    }
+
+    /// The exact stable-model test: `Cn(P^S) == S`.
+    #[inline(always)]
+    pub fn is_answer_set(&self, materialized: &Word256, s: &AnswerSetMask) -> bool {
+        self.gl_reduct_consequences(materialized, s) == *s
+    }
+
+    /// Two-pass stratified pruning from the empty worldview: `S1 = Cn(P^∅)`,
+    /// then `S2 = Cn(P^S1)`. Every coordinate leaf outside `S2` is stamped
+    /// `Tombstone` in place and `S2` is returned.
+    ///
+    /// This is an approximation, not the fixed point: `S2` is a stable model
+    /// only when [`is_answer_set`](Self::is_answer_set) says so. It is the
+    /// bounded-cost pass the arena runs on every frontier node; the exact
+    /// check is one call away for callers that need it.
+    pub fn prune_frontier(&mut self) -> AnswerSetMask {
+        let mat = self.materialize();
+        let s1 = self.gl_reduct_consequences(&mat, &AnswerSetMask::empty());
+        let s2 = self.gl_reduct_consequences(&mat, &s1);
+        let mut idx = 0usize;
+        while idx < LEAVES {
+            if self.0.trits[idx] < MAX_PACKED && !s2.contains(idx as u8) {
+                self.0.trits[idx] = Sentinel::Tombstone as u8;
+            }
+            idx += 1;
+        }
+        s2
+    }
+}
+
+#[cfg(test)]
+mod arena_tests {
+    use super::*;
+
+    fn word(seed: u64) -> Word256 {
+        Word256 {
+            hash: seed,
+            parent: 0,
+            trits: [0; PAYLOAD_BYTES],
+        }
+    }
+
+    #[test]
+    fn mask_insert_contains_count_and_winner() {
+        let mut m = AnswerSetMask::empty();
+        assert!(m.is_empty());
+        assert_eq!(m.first_winner(), None);
+        m.insert(200);
+        m.insert(5);
+        m.insert(255);
+        assert!(m.contains(5) && m.contains(200) && m.contains(255));
+        assert!(!m.contains(6));
+        assert_eq!(m.count_ones(), 3);
+        assert_eq!(m.first_winner(), Some(5));
+        let mut only_sentinel = AnswerSetMask::empty();
+        only_sentinel.insert(250);
+        assert_eq!(only_sentinel.first_winner(), None);
+    }
+
+    #[test]
+    fn arena_indexing_round_trips() {
+        assert_eq!(PertaroArena121::node_index(0, 0), 0);
+        assert_eq!(PertaroArena121::node_index(4, 80), ARENA_NODES - 1);
+        for p in 0..FRONTIER_START {
+            for c in PertaroArena121::children_of(p) {
+                assert!(c < ARENA_NODES);
+                assert_eq!(PertaroArena121::parent_of(c), p);
+            }
+        }
+        assert_eq!(
+            PertaroArena121::children_of(FRONTIER_START - 1)[2],
+            ARENA_NODES - 1
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn frontier_has_no_children() {
+        let _ = PertaroArena121::children_of(FRONTIER_START);
+    }
+
+    #[test]
+    fn expand_is_deterministic_links_parents_and_takes_every_atom() {
+        let mut a = PertaroArena121::ZERO;
+        let mut b = PertaroArena121::ZERO;
+        a.expand_from_root(0xDEAD_BEEF, 7, Sentinel::BusIndirect);
+        b.expand_from_root(0xDEAD_BEEF, 7, Sentinel::BusIndirect);
+        for i in 0..ARENA_NODES {
+            assert_eq!(a.nodes[i].0, b.nodes[i].0, "node {i}");
+        }
+        for i in 1..ARENA_NODES {
+            assert_eq!(a.nodes[i].parent() as usize, PertaroArena121::parent_of(i));
+            assert_eq!(a.nodes[i].root_sentinel(), Some(Sentinel::BusIndirect));
+            assert_ne!(a.nodes[i].seed(), 0);
+        }
+        // siblings differ
+        let [c0, c1, c2] = PertaroArena121::children_of(0);
+        assert_ne!(a.nodes[c0].seed(), a.nodes[c1].seed());
+        assert_ne!(a.nodes[c1].seed(), a.nodes[c2].seed());
+        // the paste's wrapping_add would panic here; the modulo does not
+        a.expand_from_root(1, 242, Sentinel::NullNode);
+        assert_eq!(a.frontier().len(), FRONTIER_NODES);
+    }
+
+    #[test]
+    fn reduct_derives_facts_blocks_tombstones_and_respects_naf() {
+        let mut w = word(99);
+        w.trits[0] = Sentinel::NullNode as u8; // fact
+        w.trits[1] = Sentinel::Tombstone as u8; // constraint
+        w.trits[2] = 3; // rule 2 :- not v, with v = materialized value
+        let x = PertaroExpert243(w);
+        let mat = x.materialize();
+        let v = mat.trits[2];
+        assert!(v < MAX_PACKED);
+
+        let cn_empty = x.gl_reduct_consequences(&mat, &AnswerSetMask::empty());
+        assert!(cn_empty.contains(0));
+        assert!(!cn_empty.contains(1));
+        assert!(cn_empty.contains(2));
+
+        let mut s = AnswerSetMask::empty();
+        s.insert(v);
+        let cn_s = x.gl_reduct_consequences(&mat, &s);
+        assert!(cn_s.contains(0));
+        assert!(!cn_s.contains(1));
+        assert!(
+            !cn_s.contains(2),
+            "rule 2 :- not {v} must be deleted when {v} is in S"
+        );
+    }
+
+    #[test]
+    fn facts_only_program_has_exactly_one_answer_set() {
+        let mut w = word(5);
+        for t in w.trits[..LEAVES].iter_mut() {
+            *t = Sentinel::Tombstone as u8;
+        }
+        w.trits[10] = Sentinel::NullNode as u8;
+        w.trits[20] = Sentinel::NullNode as u8;
+        let x = PertaroExpert243(w);
+        let mat = x.materialize();
+        let mut facts = AnswerSetMask::empty();
+        facts.insert(10);
+        facts.insert(20);
+        assert!(x.is_answer_set(&mat, &facts));
+        assert!(!x.is_answer_set(&mat, &AnswerSetMask::empty()));
+        let mut too_many = facts;
+        too_many.insert(30);
+        assert!(!x.is_answer_set(&mat, &too_many));
+    }
+
+    #[test]
+    fn prune_is_idempotent_and_leaves_only_supported_coordinates() {
+        let mut x = PertaroExpert243(word(0xC0FFEE));
+        for (i, t) in x.0.trits[..LEAVES].iter_mut().enumerate() {
+            *t = (i % 7) as u8;
+        }
+        x.0.trits[0] = Sentinel::NullNode as u8;
+        let s2 = x.prune_frontier();
+        assert!(s2.contains(0));
+        for i in 0..LEAVES {
+            let raw = x.0.trits[i];
+            if raw < MAX_PACKED {
+                assert!(
+                    s2.contains(i as u8),
+                    "leaf {i} survived pruning but is not in S2"
+                );
+            }
+        }
+        let again = x.prune_frontier();
+        assert_eq!(again, s2);
     }
 }
