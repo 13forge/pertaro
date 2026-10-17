@@ -838,10 +838,10 @@ mod arena_tests {
         for i in 0..ARENA_NODES {
             assert_eq!(a.nodes[i].0, b.nodes[i].0, "node {i}");
         }
-        for i in 1..ARENA_NODES {
-            assert_eq!(a.nodes[i].parent() as usize, PertaroArena121::parent_of(i));
-            assert_eq!(a.nodes[i].root_sentinel(), Some(Sentinel::BusIndirect));
-            assert_ne!(a.nodes[i].seed(), 0);
+        for (i, node) in a.nodes.iter().enumerate().skip(1) {
+            assert_eq!(node.parent() as usize, PertaroArena121::parent_of(i));
+            assert_eq!(node.root_sentinel(), Some(Sentinel::BusIndirect));
+            assert_ne!(node.seed(), 0);
         }
         // siblings differ
         let [c0, c1, c2] = PertaroArena121::children_of(0);
@@ -908,8 +908,7 @@ mod arena_tests {
         x.0.trits[0] = Sentinel::NullNode as u8;
         let s2 = x.prune_frontier();
         assert!(s2.contains(0));
-        for i in 0..LEAVES {
-            let raw = x.0.trits[i];
+        for (i, &raw) in x.0.trits[..LEAVES].iter().enumerate() {
             if raw < MAX_PACKED {
                 assert!(
                     s2.contains(i as u8),
@@ -1019,9 +1018,9 @@ mod kernel_equivalence {
             let r1 = reference_reduct(&x, &mat, &AnswerSetMask::empty());
             let r2 = reference_reduct(&x, &mat, &r1);
             let mut expect = x;
-            for i in 0..LEAVES {
-                if expect.0.trits[i] < MAX_PACKED && !r2.contains(i as u8) {
-                    expect.0.trits[i] = Sentinel::Tombstone as u8;
+            for (i, t) in expect.0.trits[..LEAVES].iter_mut().enumerate() {
+                if *t < MAX_PACKED && !r2.contains(i as u8) {
+                    *t = Sentinel::Tombstone as u8;
                 }
             }
             let mut got = PertaroExpert243(w);
